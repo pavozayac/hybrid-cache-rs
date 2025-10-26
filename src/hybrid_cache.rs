@@ -71,26 +71,67 @@ impl<T> HybridCache<T>
 where
     T: DistributedCache + Send + Sync,
 {
-    pub async fn cache<V>(&self, key: impl Into<String>, item: V) -> anyhow::Result<()>
+    pub async fn cache<V, K>(&self, key: K, item: V) -> anyhow::Result<()>
     where
-        V: serde::Serialize,
+        K: Into<String> + Send + Clone,
+        V: serde::Serialize + Send + Clone,
     {
-        self.in_memory_cache
-            .insert(
-                key.into(),
-                serialize_repr(item, self.cached_representation)?,
-            )
-            .await;
+        tokio::join!(
+            self.cache_in_memory(key.clone(), item.clone()),
+            self.distributed_cache.cache(key, item),
+        );
 
         Ok(())
     }
 
-    pub async fn retrieve<V>(&self, key: impl Into<String>) -> anyhow::Result<KeyValuePair<V>>
+    async fn cache_in_memory<V, K>(&self, key: K, item: V) -> Result<(), anyhow::Error>
     where
-        V: serde::Serialize + for<'de> serde::Deserialize<'de>,
+        K: Into<String> + Send + Clone,
+        V: serde::Serialize + Send + Clone,
+    {
+        Ok(self
+            .in_memory_cache
+            .insert(
+                key.clone().into(),
+                serialize_repr(item.clone(), self.cached_representation)?,
+            )
+            .await)
+    }
+
+    pub async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
+        I: Into<String> + Send + Clone,
     {
         let str_key = key.into();
 
+        let in_memory_entry = self.retrieve_from_memory(str_key.clone()).await;
+
+        match in_memory_entry {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                let distributed_entry: anyhow::Result<KeyValuePair<V>> =
+                    self.retrieve_from_distributed(str_key).await;
+
+                if let Ok(kvp) = distributed_entry {
+                    self.cache_in_memory(kvp.key.clone(), kvp.value.clone())
+                        .await;
+
+                    Ok(KeyValuePair { ..kvp })
+                } else {
+                    distributed_entry
+                }
+            }
+        }
+    }
+
+    async fn retrieve_from_memory<V>(
+        &self,
+        str_key: String,
+    ) -> Result<KeyValuePair<V>, anyhow::Error>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
         let cached_bytes = self
             .in_memory_cache
             .get(&str_key)
@@ -98,19 +139,31 @@ where
             .ok_or(anyhow::anyhow!(
                 "Could not retrieve value from memory cache"
             ))?;
-
         let kvp = KeyValuePair {
             key: str_key,
             value: deserialize_repr(cached_bytes.as_slice(), self.cached_representation)?,
         };
-
         Ok(kvp)
     }
 
-    pub async fn cache_many(
+    async fn retrieve_from_distributed<V>(
         &self,
-        kvps: impl IntoIterator<Item = KeyValuePair<impl serde::Serialize>>,
-    ) {
+        str_key: String,
+    ) -> Result<KeyValuePair<V>, anyhow::Error>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
+    {
+        self.distributed_cache
+            .retrieve(&str_key)
+            .await
+            .context("Could not retrieve value from distributed cache")
+    }
+
+    pub async fn cache_many<I, V>(&self, kvps: I)
+    where
+        V: serde::Serialize + Send + Clone,
+        I: IntoIterator<Item = KeyValuePair<V>>,
+    {
         let _ = kvps
             .into_iter()
             .map(|kvp| self.cache(kvp.key, kvp.value))
@@ -118,12 +171,14 @@ where
             .await;
     }
 
-    pub async fn retrieve_many<V>(
+    pub async fn retrieve_many<K, V, I>(
         &self,
-        keys: impl IntoIterator<Item = impl Into<String>>,
+        keys: I,
     ) -> anyhow::Result<impl IntoIterator<Item = KeyValuePair<V>>>
     where
-        V: serde::Serialize + for<'de> serde::Deserialize<'de>,
+        K: Into<String> + Send + Clone,
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
+        I: IntoIterator<Item = K>,
     {
         let kvps = keys
             .into_iter()
@@ -141,8 +196,8 @@ where
         constructor: F,
     ) -> anyhow::Result<KeyValuePair<V>>
     where
-        K: Into<String> + Clone,
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone,
+        K: Into<String> + Clone + Send,
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send,
         F: Fn(K) -> V,
     {
         if let Ok(value) = self.retrieve(key.clone()).await {
@@ -164,8 +219,8 @@ where
         constructor: F,
     ) -> anyhow::Result<impl IntoIterator<Item = KeyValuePair<V>>>
     where
-        K: Into<String> + Clone,
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone,
+        K: Into<String> + Clone + Send,
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send,
         F: Fn(K) -> V + Copy,
     {
         let results = keys
@@ -213,15 +268,13 @@ mod tests {
             Ok(())
         }
 
-        async fn retrieve<V, I: Into<String> + Send>(
-            &self,
-            key: I,
-        ) -> anyhow::Result<KeyValuePair<V>>
+        async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
         where
             V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
+            I: Into<String> + Send + Clone,
         {
             Ok(KeyValuePair {
-                key: "mock_key".to_string(),
+                key: key.clone().into(),
                 value: serde_json::from_slice(
                     self.cache
                         .get(&key.into())
@@ -770,5 +823,335 @@ mod tests {
             sorted_results[1].value.value,
             "string_constructed_string_key2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cache_populates_both_levels() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache)
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let test_data = TestData {
+            value: "both_levels_test".to_string(),
+        };
+
+        // Cache the data
+        cache.cache("test_key", test_data.clone()).await.unwrap();
+
+        // Verify data is in memory cache
+        let memory_result = cache
+            .retrieve_from_memory::<TestData>("test_key".to_string())
+            .await;
+        assert!(memory_result.is_ok());
+        assert_eq!(memory_result.unwrap().value.value, test_data.value);
+
+        // Verify data is in distributed cache by bypassing memory cache
+        let distributed_result = cache
+            .retrieve_from_distributed::<TestData>("test_key".to_string())
+            .await;
+        assert!(distributed_result.is_ok());
+        // Note: TestDistributedCache returns "mock_key" as the key, but the value should match
+        assert_eq!(distributed_result.unwrap().value.value, test_data.value);
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_fallback_from_memory_to_distributed() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let test_data = TestData {
+            value: "fallback_test".to_string(),
+        };
+
+        // Manually populate only the distributed cache
+        distributed_cache
+            .cache("fallback_key", test_data.clone())
+            .await
+            .unwrap();
+
+        // Verify memory cache doesn't have the value
+        let memory_result = cache
+            .retrieve_from_memory::<TestData>("fallback_key".to_string())
+            .await;
+        assert!(memory_result.is_err());
+
+        // Retrieve should fallback to distributed cache
+        let retrieved: TestData = cache.retrieve("fallback_key").await.unwrap().value;
+        assert_eq!(retrieved.value, test_data.value);
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_memory_cache_hit_skips_distributed() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let memory_data = TestData {
+            value: "memory_priority".to_string(),
+        };
+        let distributed_data = TestData {
+            value: "distributed_should_not_be_used".to_string(),
+        };
+
+        // Populate both caches with different values
+        distributed_cache
+            .cache("priority_key", distributed_data)
+            .await
+            .unwrap();
+
+        // Manually populate memory cache
+        let serialized = serialize_repr(memory_data.clone(), cache.cached_representation).unwrap();
+        cache
+            .in_memory_cache
+            .insert("priority_key".to_string(), serialized)
+            .await;
+
+        // Retrieve should return memory cache value (not distributed)
+        let retrieved: TestData = cache.retrieve("priority_key").await.unwrap().value;
+        assert_eq!(retrieved.value, "memory_priority");
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_both_caches_miss() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache)
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        // Try to retrieve a key that doesn't exist in either cache
+        let result: anyhow::Result<KeyValuePair<TestData>> =
+            cache.retrieve("nonexistent_key").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cache_many_populates_both_levels() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let kvps = vec![
+            KeyValuePair {
+                key: "multi_key1".to_string(),
+                value: TestData {
+                    value: "multi_value1".to_string(),
+                },
+            },
+            KeyValuePair {
+                key: "multi_key2".to_string(),
+                value: TestData {
+                    value: "multi_value2".to_string(),
+                },
+            },
+        ];
+
+        let static_cache = Box::leak(Box::new(cache));
+        static_cache.cache_many(kvps.clone()).await;
+
+        // Give tasks time to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify both items are in memory cache
+        for kvp in &kvps {
+            let memory_result = static_cache
+                .retrieve_from_memory::<TestData>(kvp.key.clone())
+                .await;
+            assert!(memory_result.is_ok());
+            assert_eq!(memory_result.unwrap().value.value, kvp.value.value);
+        }
+
+        // Verify both items are in distributed cache
+        for kvp in &kvps {
+            let distributed_result = static_cache
+                .retrieve_from_distributed::<TestData>(kvp.key.clone())
+                .await;
+            assert!(distributed_result.is_ok());
+            assert_eq!(distributed_result.unwrap().value.value, kvp.value.value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_many_mixed_cache_levels() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let memory_only_data = TestData {
+            value: "memory_only".to_string(),
+        };
+        let distributed_only_data = TestData {
+            value: "distributed_only".to_string(),
+        };
+        let both_caches_data = TestData {
+            value: "both_caches".to_string(),
+        };
+
+        // Populate memory only
+        let serialized_memory =
+            serialize_repr(memory_only_data.clone(), cache.cached_representation).unwrap();
+        cache
+            .in_memory_cache
+            .insert("memory_key".to_string(), serialized_memory)
+            .await;
+
+        // Populate distributed only
+        distributed_cache
+            .cache("distributed_key", distributed_only_data.clone())
+            .await
+            .unwrap();
+
+        // Populate both caches
+        cache
+            .cache("both_key", both_caches_data.clone())
+            .await
+            .unwrap();
+
+        let static_cache = Box::leak(Box::new(cache));
+        let keys = vec!["memory_key", "distributed_key", "both_key"];
+        let results: Vec<KeyValuePair<TestData>> = static_cache
+            .retrieve_many(keys)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(results.len(), 3);
+
+        // Find results by key
+        let memory_result = results.iter().find(|kvp| kvp.key == "memory_key").unwrap();
+        let distributed_result = results
+            .iter()
+            .find(|kvp| kvp.key == "distributed_key")
+            .unwrap();
+        let both_result = results.iter().find(|kvp| kvp.key == "both_key").unwrap();
+
+        assert_eq!(memory_result.value.value, "memory_only");
+        assert_eq!(distributed_result.value.value, "distributed_only");
+        assert_eq!(both_result.value.value, "both_caches");
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_or_else_populates_both_caches_on_miss() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let constructor = |key: &str| TestData {
+            value: format!("constructed_{}", key),
+        };
+
+        // Key doesn't exist in either cache
+        let result = cache
+            .retrieve_or_else("new_key", constructor)
+            .await
+            .unwrap();
+        assert_eq!(result.value.value, "constructed_new_key");
+
+        // Verify both caches now have the constructed value
+        let memory_result = cache
+            .retrieve_from_memory::<TestData>("new_key".to_string())
+            .await;
+        assert!(memory_result.is_ok());
+        assert_eq!(memory_result.unwrap().value.value, "constructed_new_key");
+
+        let distributed_result = cache
+            .retrieve_from_distributed::<TestData>("new_key".to_string())
+            .await;
+        assert!(distributed_result.is_ok());
+        assert_eq!(
+            distributed_result.unwrap().value.value,
+            "constructed_new_key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_or_else_fallback_behavior() {
+        let distributed_cache = TestDistributedCache::default();
+        let cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let distributed_data = TestData {
+            value: "from_distributed".to_string(),
+        };
+
+        // Populate only distributed cache
+        distributed_cache
+            .cache("fallback_test_key", distributed_data.clone())
+            .await
+            .unwrap();
+
+        let constructor = |_key: &str| TestData {
+            value: "should_not_construct".to_string(),
+        };
+
+        // Should retrieve from distributed cache, not construct
+        let result = cache
+            .retrieve_or_else("fallback_test_key", constructor)
+            .await
+            .unwrap();
+        assert_eq!(result.value.value, "from_distributed");
+    }
+
+    #[tokio::test]
+    async fn test_cache_with_different_serialization_formats() {
+        let distributed_cache = TestDistributedCache::default();
+
+        // Test Binary serialization
+        let binary_cache = HybridCache::builder()
+            .distributed_cache(distributed_cache.clone())
+            .cached_representation(CachedRepresentation::Binary)
+            .build();
+
+        let test_data = TestData {
+            value: "serialization_test".to_string(),
+        };
+
+        binary_cache
+            .cache("binary_key", test_data.clone())
+            .await
+            .unwrap();
+
+        // Verify memory cache has binary serialized data
+        let binary_bytes = binary_cache
+            .in_memory_cache
+            .get("binary_key")
+            .await
+            .unwrap();
+        let deserialized_binary: TestData =
+            deserialize_repr(&binary_bytes, CachedRepresentation::Binary).unwrap();
+        assert_eq!(deserialized_binary.value, test_data.value);
+
+        // Test JSON serialization
+        let json_cache = HybridCache::builder()
+            .distributed_cache(distributed_cache)
+            .cached_representation(CachedRepresentation::Json)
+            .build();
+
+        json_cache
+            .cache("json_key", test_data.clone())
+            .await
+            .unwrap();
+
+        // Verify memory cache has JSON serialized data
+        let json_bytes = json_cache.in_memory_cache.get("json_key").await.unwrap();
+        let deserialized_json: TestData =
+            deserialize_repr(&json_bytes, CachedRepresentation::Json).unwrap();
+        assert_eq!(deserialized_json.value, test_data.value);
     }
 }
