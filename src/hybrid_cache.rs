@@ -75,10 +75,12 @@ where
     where
         V: serde::Serialize,
     {
-        self.in_memory_cache.insert(
-            key.into(),
-            serialize_repr(item, self.cached_representation)?,
-        ).await;
+        self.in_memory_cache
+            .insert(
+                key.into(),
+                serialize_repr(item, self.cached_representation)?,
+            )
+            .await;
 
         Ok(())
     }
