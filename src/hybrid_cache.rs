@@ -39,48 +39,46 @@ impl<T: DistributedCache> HybridCache<T> {
     }
 }
 
+fn serialize_repr(
+    value: impl serde::Serialize,
+    cached_representation: CachedRepresentation,
+) -> anyhow::Result<Vec<u8>> {
+    match cached_representation {
+        CachedRepresentation::Binary => {
+            postcard::to_allocvec(&value).context("Serialization failure using postcard")
+        }
+        CachedRepresentation::Json => {
+            serde_json::to_vec(&value).context("Serialization failure using serde_json")
+        }
+    }
+}
+
+fn deserialize_repr<'de, V: serde::Deserialize<'de>>(
+    bytes: &'de [u8],
+    cached_representation: CachedRepresentation,
+) -> anyhow::Result<V> {
+    match cached_representation {
+        CachedRepresentation::Binary => {
+            postcard::from_bytes(bytes).context("Deserialization failure using postcard")
+        }
+        CachedRepresentation::Json => {
+            serde_json::from_slice(bytes).context("Deserialization failure using serde_json")
+        }
+    }
+}
+
 impl<T> HybridCache<T>
 where
     T: DistributedCache + Send + Sync,
 {
-    fn serialize_repr(
-        value: impl serde::Serialize,
-        cached_representation: CachedRepresentation,
-    ) -> anyhow::Result<Vec<u8>> {
-        match cached_representation {
-            CachedRepresentation::Binary => {
-                postcard::to_allocvec(&value).context("Serialization failure using postcard")
-            }
-            CachedRepresentation::Json => {
-                serde_json::to_vec(&value).context("Serialization failure using serde_json")
-            }
-        }
-    }
-
-    fn deserialize_repr<'de, V: serde::Deserialize<'de>>(
-        bytes: &'de [u8],
-        cached_representation: CachedRepresentation,
-    ) -> anyhow::Result<V> {
-        match cached_representation {
-            CachedRepresentation::Binary => {
-                postcard::from_bytes(bytes).context("Deserialization failure using postcard")
-            }
-            CachedRepresentation::Json => {
-                serde_json::from_slice(bytes).context("Deserialization failure using serde_json")
-            }
-        }
-    }
-
     pub async fn cache<V>(&self, key: impl Into<String>, item: V) -> anyhow::Result<()>
     where
         V: serde::Serialize,
     {
-        self.in_memory_cache
-            .insert(
-                key.into(),
-                Self::serialize_repr(item, self.cached_representation)?,
-            )
-            .await;
+        self.in_memory_cache.insert(
+            key.into(),
+            serialize_repr(item, self.cached_representation)?,
+        ).await;
 
         Ok(())
     }
@@ -101,7 +99,7 @@ where
 
         let kvp = KeyValuePair {
             key: str_key,
-            value: Self::deserialize_repr(cached_bytes.as_slice(), self.cached_representation)?,
+            value: deserialize_repr(cached_bytes.as_slice(), self.cached_representation)?,
         };
 
         Ok(kvp)
@@ -135,7 +133,7 @@ where
         Ok(kvps)
     }
 
-    pub async fn retrieve_or_cache<K, V, F>(
+    pub async fn retrieve_or_else<K, V, F>(
         &self,
         key: K,
         constructor: F,
@@ -158,7 +156,7 @@ where
         })
     }
 
-    pub async fn retrieve_or_cache_many<K, V, F>(
+    pub async fn retrieve_many_or_else<K, V, F>(
         &self,
         keys: impl IntoIterator<Item = K>,
         constructor: F,
@@ -170,7 +168,7 @@ where
     {
         let results = keys
             .into_iter()
-            .map(|key| self.retrieve_or_cache(key, constructor))
+            .map(|key| self.retrieve_or_else(key, constructor))
             .collect::<TryJoinAll<_>>()
             .await?
             .into_iter();
@@ -186,13 +184,52 @@ mod tests {
     use crate::{CachedRepresentation, DistributedCache};
 
     use super::*;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    #[derive(Debug, Clone)]
-    struct TestDistributedCache;
+    #[derive(Clone)]
+    struct TestDistributedCache {
+        cache: moka::future::Cache<String, Vec<u8>>,
+    }
+
+    impl Default for TestDistributedCache {
+        fn default() -> Self {
+            Self {
+                cache: moka::future::Cache::new(10_000),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
-    impl DistributedCache for TestDistributedCache {}
+    impl DistributedCache for TestDistributedCache {
+        async fn cache<V, I: Into<String> + Send>(&self, key: I, item: V) -> anyhow::Result<()>
+        where
+            V: serde::Serialize + Send,
+        {
+            self.cache
+                .insert(key.into(), serde_json::to_vec(&item)?)
+                .await;
+            Ok(())
+        }
+
+        async fn retrieve<V, I: Into<String> + Send>(
+            &self,
+            key: I,
+        ) -> anyhow::Result<KeyValuePair<V>>
+        where
+            V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
+        {
+            Ok(KeyValuePair {
+                key: "mock_key".to_string(),
+                value: serde_json::from_slice(
+                    self.cache
+                        .get(&key.into())
+                        .await
+                        .ok_or(anyhow::anyhow!("Mock error"))?
+                        .as_slice(),
+                )?,
+            })
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct TestData {
@@ -201,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hybrid_cache_new() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .in_memory_ttl(Duration::from_secs(60))
@@ -218,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_and_retrieve() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -238,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_nonexistent_key() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -252,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_different_representations() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
 
         // Test with Binary representation
         let cache_binary = HybridCache::builder()
@@ -291,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_with_string_key() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let mut cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -321,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_many() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -367,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_many() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -411,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_many_with_missing_keys() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -437,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_many_with_string_keys() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -482,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_existing_key() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -505,7 +542,7 @@ mod tests {
 
         // Retrieve or cache should return the existing value
         let result = cache
-            .retrieve_or_cache("existing_key", constructor)
+            .retrieve_or_else("existing_key", constructor)
             .await
             .unwrap();
 
@@ -515,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_missing_key() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -528,7 +565,7 @@ mod tests {
 
         // Retrieve or cache should create and cache the value
         let result = cache
-            .retrieve_or_cache("missing_key", constructor)
+            .retrieve_or_else("missing_key", constructor)
             .await
             .unwrap();
 
@@ -542,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_with_string_keys() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -554,7 +591,7 @@ mod tests {
 
         // Test with owned String key
         let result = cache
-            .retrieve_or_cache("string_key".to_string(), constructor)
+            .retrieve_or_else("string_key".to_string(), constructor)
             .await
             .unwrap();
 
@@ -564,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_many_all_existing() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -590,7 +627,7 @@ mod tests {
 
         let static_cache = Box::leak(Box::new(cache));
         let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_or_cache_many(kvps, constructor)
+            .retrieve_many_or_else(kvps, constructor)
             .await
             .unwrap()
             .into_iter()
@@ -610,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_many_all_missing() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -625,7 +662,7 @@ mod tests {
 
         let static_cache = Box::leak(Box::new(cache));
         let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_or_cache_many(kvps, constructor)
+            .retrieve_many_or_else(kvps, constructor)
             .await
             .unwrap()
             .into_iter()
@@ -652,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_many_mixed() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -673,7 +710,7 @@ mod tests {
 
         let static_cache = Box::leak(Box::new(cache));
         let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_or_cache_many(kvps, constructor)
+            .retrieve_many_or_else(kvps, constructor)
             .await
             .unwrap()
             .into_iter()
@@ -696,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_or_cache_many_with_string_keys() {
-        let distributed_cache = TestDistributedCache;
+        let distributed_cache = TestDistributedCache::default();
         let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
@@ -710,7 +747,7 @@ mod tests {
 
         let static_cache = Box::leak(Box::new(cache));
         let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_or_cache_many(keys, constructor)
+            .retrieve_many_or_else(keys, constructor)
             .await
             .unwrap()
             .into_iter()
