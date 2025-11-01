@@ -1,11 +1,11 @@
 use bytes::Bytes;
 use hybrid_cache_rs::{BatchingDistributedCache, DistributedCache};
-use testcontainers::runners::AsyncRunner;
+use testcontainers::{runners::AsyncRunner, ContainerAsync};
+use testcontainers_modules::redis::Redis;
 
 use std::time::Duration;
 
-#[tokio::test]
-async fn redis_cache_integration() -> anyhow::Result<()> {
+async fn redis_container() -> anyhow::Result<(ContainerAsync<Redis>, String)> {
     // Start a docker-backed Redis container using testcontainers
     let node = testcontainers_modules::redis::Redis::default()
         .start()
@@ -15,6 +15,12 @@ async fn redis_cache_integration() -> anyhow::Result<()> {
     let host = node.get_host_port_ipv4(6379).await?;
     let redis_url = format!("redis://127.0.0.1:{host}");
 
+    Ok((node, redis_url))
+}
+
+#[tokio::test]
+async fn redis_cache_single_operations() -> anyhow::Result<()> {
+    let (_container, redis_url) = redis_container().await?;
     // Create the cache implementation
     let cache = hybrid_cache_rs::redis_impl::RedisDistributedCache::new(&redis_url)?;
 
@@ -28,6 +34,19 @@ async fn redis_cache_integration() -> anyhow::Result<()> {
 
     let got = cache.retrieve_bytes(key).await?;
     assert_eq!(&*got, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_cache_batch_operations() -> anyhow::Result<()> {
+    let (_container, redis_url) = redis_container().await?;
+
+    // Create the cache implementation
+    let cache = hybrid_cache_rs::redis_impl::RedisDistributedCache::new(&redis_url)?;
+
+    // Small sleep to ensure redis is ready to accept connections (testcontainers wait-for isn't always immediate)
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Batch operations
     let items = vec![("k1", Bytes::from("v1")), ("k2", Bytes::from("v2"))];
