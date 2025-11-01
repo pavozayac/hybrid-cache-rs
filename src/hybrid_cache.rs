@@ -76,10 +76,12 @@ where
         K: Into<String> + Send + Clone,
         V: serde::Serialize + Send + Clone,
     {
-        tokio::join!(
-            self.cache_in_memory(key.clone(), item.clone()),
-            self.distributed_cache.cache(key, item),
-        );
+        let key_str = key.clone().into();
+
+        tokio::join!(self.cache_in_memory(key.clone(), item.clone()), async {
+            let bytes = serialize_repr(item.clone(), self.cached_representation)?;
+            self.distributed_cache.cache_bytes(&key_str, &bytes).await
+        },);
 
         Ok(())
     }
@@ -153,10 +155,16 @@ where
     where
         V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
     {
-        self.distributed_cache
-            .retrieve(&str_key)
+        let bytes = self
+            .distributed_cache
+            .retrieve_bytes(&str_key)
             .await
-            .context("Could not retrieve value from distributed cache")
+            .context("Could not retrieve value from distributed cache")?;
+
+        Ok(KeyValuePair {
+            key: str_key,
+            value: deserialize_repr(bytes.as_ref(), self.cached_representation)?,
+        })
     }
 
     pub async fn cache_many<I, V>(&self, kvps: I)
@@ -236,6 +244,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use serde_derive::{Deserialize, Serialize};
 
     use crate::{CachedRepresentation, DistributedCache};
@@ -258,31 +267,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DistributedCache for TestDistributedCache {
-        async fn cache<V, I: Into<String> + Send>(&self, key: I, item: V) -> anyhow::Result<()>
-        where
-            V: serde::Serialize + Send,
-        {
-            self.cache
-                .insert(key.into(), serde_json::to_vec(&item)?)
-                .await;
+        async fn cache_bytes(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.cache.insert(key.to_string(), bytes.to_vec()).await;
             Ok(())
         }
 
-        async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
-        where
-            V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
-            I: Into<String> + Send + Clone,
-        {
-            Ok(KeyValuePair {
-                key: key.clone().into(),
-                value: serde_json::from_slice(
-                    self.cache
-                        .get(&key.into())
-                        .await
-                        .ok_or(anyhow::anyhow!("Mock error"))?
-                        .as_slice(),
-                )?,
-            })
+        async fn retrieve_bytes(&self, key: &str) -> anyhow::Result<Bytes> {
+            self.cache
+                .get(key)
+                .await
+                .ok_or(anyhow::anyhow!("Mock error"))
+                .map(Bytes::from)
         }
     }
 
@@ -870,7 +865,10 @@ mod tests {
 
         // Manually populate only the distributed cache
         distributed_cache
-            .cache("fallback_key", test_data.clone())
+            .cache_bytes(
+                "fallback_key",
+                &serialize_repr(test_data.clone(), cache.cached_representation).unwrap(),
+            )
             .await
             .unwrap();
 
@@ -902,7 +900,10 @@ mod tests {
 
         // Populate both caches with different values
         distributed_cache
-            .cache("priority_key", distributed_data)
+            .cache_bytes(
+                "priority_key",
+                &serialize_repr(distributed_data, CachedRepresentation::Binary).unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1008,7 +1009,11 @@ mod tests {
 
         // Populate distributed only
         distributed_cache
-            .cache("distributed_key", distributed_only_data.clone())
+            .cache_bytes(
+                "distributed_key",
+                &serialize_repr(distributed_only_data.clone(), CachedRepresentation::Binary)
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1092,7 +1097,10 @@ mod tests {
 
         // Populate only distributed cache
         distributed_cache
-            .cache("fallback_test_key", distributed_data.clone())
+            .cache_bytes(
+                "fallback_test_key",
+                &serialize_repr(distributed_data.clone(), CachedRepresentation::Binary).unwrap(),
+            )
             .await
             .unwrap();
 
