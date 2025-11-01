@@ -1,19 +1,26 @@
-use crate::cache_entry::KeyValuePair;
+use bytes::Bytes;
 
 mod cache_entry;
 mod hybrid_cache;
+pub mod redis_impl;
+pub use redis_impl::RedisDistributedCache;
 
 #[async_trait::async_trait]
 pub trait DistributedCache {
-    async fn cache<V, I>(&self, key: I, item: V) -> anyhow::Result<()>
-    where
-        V: serde::Serialize + Send,
-        I: Into<String> + Send + Clone;
+    async fn cache_bytes(&self, key: &str, item: &[u8]) -> anyhow::Result<()>;
 
-    async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
+    async fn retrieve_bytes(&self, key: &str) -> anyhow::Result<Bytes>;
+}
+
+#[async_trait::async_trait]
+pub trait BatchingDistributedCache {
+    async fn cache_batch<'a, I>(&self, items: I) -> anyhow::Result<()>
     where
-        V: Send + serde::Serialize + for<'de> serde::Deserialize<'de>,
-        I: Into<String> + Send + Clone;
+        I: IntoIterator<Item = (&'a str, Bytes)> + Send;
+
+    async fn retrieve_batch<'a, I>(&self, keys: I) -> anyhow::Result<Vec<Option<Bytes>>>
+    where
+        I: IntoIterator<Item = &'a str> + Send;
 }
 
 #[derive(Debug, Clone, Copy)]
