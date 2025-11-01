@@ -9,8 +9,9 @@ jobs:
         run: |
           rustup override set stable
           rustup update stable
+          cargo install cargo-nextest
       - name: Run tests
-        run: cargo test
+        run: cargo nextest run
       - name: Lint
         run: cargo clippy
       - name: Check formatting

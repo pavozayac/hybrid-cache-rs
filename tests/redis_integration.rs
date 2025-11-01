@@ -13,7 +13,7 @@ async fn redis_cache_integration() -> anyhow::Result<()> {
 
     // Obtain the mapped port and build a redis URL
     let host = node.get_host_port_ipv4(6379).await?;
-    let redis_url = format!("redis://127.0.0.1:{}", host);
+    let redis_url = format!("redis://127.0.0.1:{host}");
 
     // Create the cache implementation
     let cache = hybrid_cache_rs::redis_impl::RedisDistributedCache::new(&redis_url)?;
@@ -27,7 +27,7 @@ async fn redis_cache_integration() -> anyhow::Result<()> {
     cache.cache_bytes(key, payload).await?;
 
     let got = cache.retrieve_bytes(key).await?;
-    assert_eq!(&got[..], payload);
+    assert_eq!(&*got, payload);
 
     // Batch operations
     let items = vec![("k1", Bytes::from("v1")), ("k2", Bytes::from("v2"))];
@@ -37,8 +37,8 @@ async fn redis_cache_integration() -> anyhow::Result<()> {
     let vals = cache.retrieve_batch(keys).await?;
 
     assert_eq!(vals.len(), 3);
-    assert_eq!(vals[0].as_ref().map(|b| &b[..]), Some(b"v1" as &[u8]));
-    assert_eq!(vals[1].as_ref().map(|b| &b[..]), Some(b"v2" as &[u8]));
+    assert_eq!(vals[0].as_deref(), Some(b"v1" as &[u8]));
+    assert_eq!(vals[1].as_deref(), Some(b"v2" as &[u8]));
     assert!(vals[2].is_none());
 
     Ok(())
