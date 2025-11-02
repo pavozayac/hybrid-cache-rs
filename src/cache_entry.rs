@@ -1,6 +1,6 @@
 use serde_derive::{Deserialize, Serialize};
 
-struct CacheEntry<V>
+pub struct CacheEntry<V>
 where
     V: serde::Serialize,
 {

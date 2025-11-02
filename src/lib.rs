@@ -1,10 +1,16 @@
 use bytes::Bytes;
+#[cfg(test)]
+use mockall;
 
-mod cache_entry;
+pub mod cache_entry;
 mod hybrid_cache;
+pub use hybrid_cache::HybridCache;
 pub mod redis_impl;
 pub use redis_impl::RedisDistributedCache;
+mod noop_impl;
+pub use noop_impl::NoopDistributedCache;
 
+#[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait DistributedCache {
     async fn cache_bytes(&self, key: &str, item: &[u8]) -> anyhow::Result<()>;
