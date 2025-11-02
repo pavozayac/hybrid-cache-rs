@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures::future::TryJoinAll;
+use futures::future::JoinAll;
 
 use crate::{cache_entry::KeyValuePair, CachedRepresentation, DistributedCache};
 
@@ -78,10 +78,13 @@ where
     {
         let key_str = key.clone().into();
 
-        tokio::join!(self.cache_in_memory(key.clone(), item.clone()), async {
+        let (one, two) = tokio::join!(self.cache_in_memory(key.clone(), item.clone()), async {
             let bytes = serialize_repr(item.clone(), self.cached_representation)?;
             self.distributed_cache.cache_bytes(&key_str, &bytes).await
-        },);
+        });
+
+        one.unwrap();
+        two.unwrap();
 
         Ok(())
     }
@@ -91,13 +94,14 @@ where
         K: Into<String> + Send + Clone,
         V: serde::Serialize + Send + Clone,
     {
-        Ok(self
-            .in_memory_cache
+        self.in_memory_cache
             .insert(
                 key.clone().into(),
                 serialize_repr(item.clone(), self.cached_representation)?,
             )
-            .await)
+            .await;
+
+        Ok(())
     }
 
     pub async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
@@ -106,25 +110,22 @@ where
         I: Into<String> + Send + Clone,
     {
         let str_key = key.into();
-
         let in_memory_entry = self.retrieve_from_memory(str_key.clone()).await;
 
-        match in_memory_entry {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                let distributed_entry: anyhow::Result<KeyValuePair<V>> =
-                    self.retrieve_from_distributed(str_key).await;
-
-                if let Ok(kvp) = distributed_entry {
-                    self.cache_in_memory(kvp.key.clone(), kvp.value.clone())
-                        .await;
-
-                    Ok(KeyValuePair { ..kvp })
-                } else {
-                    distributed_entry
-                }
-            }
+        if let Ok(value) = in_memory_entry {
+            return Ok(value);
         }
+
+        let distributed_entry: anyhow::Result<KeyValuePair<V>> =
+            self.retrieve_from_distributed(str_key).await;
+
+        if let Ok(kvp) = &distributed_entry {
+            let _ = self
+                .cache_in_memory(kvp.key.clone(), kvp.value.clone())
+                .await;
+        }
+
+        distributed_entry
     }
 
     async fn retrieve_from_memory<V>(
@@ -175,7 +176,7 @@ where
         let _ = kvps
             .into_iter()
             .map(|kvp| self.cache(kvp.key, kvp.value))
-            .collect::<TryJoinAll<_>>()
+            .collect::<JoinAll<_>>()
             .await;
     }
 
@@ -188,12 +189,15 @@ where
         V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
         I: IntoIterator<Item = K>,
     {
-        let kvps = keys
+        let kvps: Vec<KeyValuePair<_>> = keys
             .into_iter()
             .map(|key| self.retrieve(key))
-            .collect::<TryJoinAll<_>>()
-            .await?
-            .into_iter();
+            .map(Box::pin)
+            .collect::<JoinAll<_>>()
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
 
         Ok(kvps)
     }
@@ -234,9 +238,10 @@ where
         let results = keys
             .into_iter()
             .map(|key| self.retrieve_or_else(key, constructor))
-            .collect::<TryJoinAll<_>>()
-            .await?
-            .into_iter();
+            .collect::<JoinAll<_>>()
+            .await
+            .into_iter()
+            .filter_map(Result::ok);
 
         Ok(results)
     }
@@ -247,7 +252,7 @@ mod tests {
     use bytes::Bytes;
     use serde_derive::{Deserialize, Serialize};
 
-    use crate::{CachedRepresentation, DistributedCache};
+    use crate::{CachedRepresentation, DistributedCache, MockDistributedCache};
 
     use super::*;
     use std::{collections::HashMap, time::Duration};
@@ -518,8 +523,11 @@ mod tests {
             .await
             .map(|iter| iter.into_iter().collect());
 
-        // Should fail because some keys are missing
-        assert!(result.is_err());
+        // Should only retrieve the present keys
+        assert!(result.is_ok());
+        assert_eq!(result.as_ref().unwrap().len(), 1);
+        assert_eq!(result.as_ref().unwrap()[0].key, "existing_key");
+        assert_eq!(result.as_ref().unwrap()[0].value.value, "existing_value");
     }
 
     #[tokio::test]
