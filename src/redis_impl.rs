@@ -3,6 +3,7 @@ use redis::AsyncCommands;
 
 use crate::DistributedCache;
 
+#[derive(Debug, Clone)]
 pub struct RedisDistributedCache {
     pub client: redis::Client,
 }
