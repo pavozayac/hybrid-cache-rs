@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::future::JoinAll;
 
-use crate::{cache_entry::KeyValuePair, CachedRepresentation, DistributedCache};
+use crate::{CachedRepresentation, DistributedCache, entry::AsEntries, key::IntoKeys};
 
 type InMemoryCache = moka::future::Cache<String, Vec<u8>>;
 
@@ -71,179 +71,178 @@ impl<T> HybridCache<T>
 where
     T: DistributedCache + Send + Sync,
 {
-    pub async fn cache<V, K>(&self, key: K, item: V) -> anyhow::Result<()>
-    where
-        K: Into<String> + Send + Clone,
-        V: serde::Serialize + Send + Clone,
-    {
-        let key_str = key.clone().into();
+    async fn set_one<S: serde::Serialize + Send>(&self, key: &str, value: S) -> anyhow::Result<()> {
+        let serialized_value = serialize_repr(&value, self.cached_representation)?;
 
-        let (one, two) = tokio::join!(self.cache_in_memory(key.clone(), item.clone()), async {
-            let bytes = serialize_repr(item.clone(), self.cached_representation)?;
-            self.distributed_cache.cache_bytes(&key_str, &bytes).await
-        });
-
-        one.unwrap();
-        two.unwrap();
+        let ((), ()) = tokio::join!(
+            self.cache_in_memory(key, &serialized_value),
+            self.cache_in_distributed(key, &serialized_value)
+        );
 
         Ok(())
     }
 
-    async fn cache_in_memory<V, K>(&self, key: K, item: V) -> Result<(), anyhow::Error>
-    where
-        K: Into<String> + Send + Clone,
-        V: serde::Serialize + Send + Clone,
-    {
+    async fn cache_in_memory(&self, key: &str, value: impl AsRef<[u8]>) {
         self.in_memory_cache
-            .insert(
-                key.clone().into(),
-                serialize_repr(item.clone(), self.cached_representation)?,
+            .insert(key.to_string(), value.as_ref().to_vec())
+            .await;
+    }
+
+    async fn cache_in_distributed(&self, key: &str, value: &[u8]) {
+        self.distributed_cache.cache_bytes(key, value).await;
+    }
+
+    async fn get_one<V>(&self, key: &str) -> anyhow::Result<V>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
+    {
+        let in_memory_entry: anyhow::Result<_> = self.retrieve_from_memory(key).await;
+
+        if let Ok(value) = &in_memory_entry {
+            return deserialize_repr(value, self.cached_representation);
+        }
+
+        let distributed_entry: V = self.retrieve_from_distributed(key).await?;
+
+        let () = self
+            .cache_in_memory(
+                key,
+                serialize_repr(&distributed_entry, self.cached_representation)?,
             )
             .await;
 
-        Ok(())
+        Ok(distributed_entry)
     }
 
-    pub async fn retrieve<V, I>(&self, key: I) -> anyhow::Result<KeyValuePair<V>>
-    where
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
-        I: Into<String> + Send + Clone,
-    {
-        let str_key = key.into();
-        let in_memory_entry = self.retrieve_from_memory(str_key.clone()).await;
+    async fn retrieve_from_memory(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        let cached_bytes = self.in_memory_cache.get(key).await.ok_or(anyhow::anyhow!(
+            "Could not retrieve value from memory cache"
+        ))?;
 
-        if let Ok(value) = in_memory_entry {
-            return Ok(value);
-        }
-
-        let distributed_entry: anyhow::Result<KeyValuePair<V>> =
-            self.retrieve_from_distributed(str_key).await;
-
-        if let Ok(kvp) = &distributed_entry {
-            let _ = self
-                .cache_in_memory(kvp.key.clone(), kvp.value.clone())
-                .await;
-        }
-
-        distributed_entry
+        Ok(cached_bytes)
     }
 
-    async fn retrieve_from_memory<V>(
-        &self,
-        str_key: String,
-    ) -> Result<KeyValuePair<V>, anyhow::Error>
+    async fn retrieve_from_distributed<V>(&self, key: &str) -> anyhow::Result<V>
     where
-        V: serde::Serialize + for<'de> serde::Deserialize<'de>,
-    {
-        let cached_bytes = self
-            .in_memory_cache
-            .get(&str_key)
-            .await
-            .ok_or(anyhow::anyhow!(
-                "Could not retrieve value from memory cache"
-            ))?;
-        let kvp = KeyValuePair {
-            key: str_key,
-            value: deserialize_repr(cached_bytes.as_slice(), self.cached_representation)?,
-        };
-        Ok(kvp)
-    }
-
-    async fn retrieve_from_distributed<V>(
-        &self,
-        str_key: String,
-    ) -> Result<KeyValuePair<V>, anyhow::Error>
-    where
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send,
+        V: for<'de> serde::Deserialize<'de> + Send,
     {
         let bytes = self
             .distributed_cache
-            .retrieve_bytes(&str_key)
+            .retrieve_bytes(key)
             .await
             .context("Could not retrieve value from distributed cache")?;
 
-        Ok(KeyValuePair {
-            key: str_key,
-            value: deserialize_repr(bytes.as_ref(), self.cached_representation)?,
-        })
+        let output = deserialize_repr(bytes.as_ref(), self.cached_representation)?;
+
+        Ok(output)
     }
 
-    pub async fn cache_many<I, V>(&self, kvps: I)
-    where
-        V: serde::Serialize + Send + Clone,
-        I: IntoIterator<Item = KeyValuePair<V>>,
-    {
-        let _ = kvps
+    pub async fn set<S: serde::Serialize + Send + Sync>(&self, entries: impl AsEntries<S>) {
+        let _ = entries
+            .as_entries()
             .into_iter()
-            .map(|kvp| self.cache(kvp.key, kvp.value))
+            .map(|(key, value)| self.set_one(key, value))
             .collect::<JoinAll<_>>()
             .await;
     }
 
-    pub async fn retrieve_many<K, V, I>(
-        &self,
-        keys: I,
-    ) -> anyhow::Result<impl IntoIterator<Item = KeyValuePair<V>>>
+    pub async fn get<'a, V>(&self, key: impl AsRef<str>) -> Option<V>
     where
-        K: Into<String> + Send + Clone,
         V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
-        I: IntoIterator<Item = K>,
     {
-        let kvps: Vec<KeyValuePair<_>> = keys
+        let item = self.get_one::<V>(key.as_ref()).await;
+
+        item.ok()
+    }
+
+    pub async fn get_many<'a, V, K: IntoKeys + 'a>(
+        &self,
+        keys: K,
+    ) -> impl IntoIterator<Item = (<K as IntoKeys>::Key<'a>, V)>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Clone,
+    {
+        keys.into_keys()
             .into_iter()
-            .map(|key| self.retrieve(key))
+            .map(|key| async move {
+                let key_ref: &str = key.as_ref();
+                let val = self.get_one(key_ref).await;
+
+                (key, val)
+            })
             .map(Box::pin)
             .collect::<JoinAll<_>>()
             .await
             .into_iter()
-            .filter_map(Result::ok)
-            .collect();
-
-        Ok(kvps)
+            .filter_map(|(key, value)| value.ok().map(|v| (key, v)))
     }
 
-    pub async fn retrieve_or_else<K, V, F>(
+    async fn get_or_create_one<'a, V, F>(
         &self,
-        key: K,
+        key: &'a str,
         constructor: F,
-    ) -> anyhow::Result<KeyValuePair<V>>
+    ) -> anyhow::Result<(&'a str, V)>
     where
-        K: Into<String> + Clone + Send,
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send,
-        F: Fn(K) -> V,
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync,
+        F: Fn(&'a str) -> V,
     {
-        if let Ok(value) = self.retrieve(key.clone()).await {
-            return Ok(value);
+        if let Ok(value) = self.get_one(key).await {
+            return Ok((key, value));
         }
 
-        let created = constructor(key.clone());
-        self.cache(key.clone(), created.clone()).await?;
+        let created = constructor(key);
+        self.set_one(key, &created).await?;
 
-        Ok(KeyValuePair {
-            key: key.into(),
-            value: created,
-        })
+        Ok((key, created))
     }
 
-    pub async fn retrieve_many_or_else<K, V, F>(
+    pub async fn get_or_create<V>(
         &self,
-        keys: impl IntoIterator<Item = K>,
-        constructor: F,
-    ) -> anyhow::Result<impl IntoIterator<Item = KeyValuePair<V>>>
+        key: impl AsRef<str>,
+        constructor: impl for<'a> AsyncFn(&'a str) -> Option<V>,
+    ) -> Option<V>
     where
-        K: Into<String> + Clone + Send,
-        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send,
-        F: Fn(K) -> V + Copy,
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync,
     {
-        let results = keys
+        let key_str = key.as_ref();
+        if let Ok(value) = self.get_one(key_str).await {
+            return Some(value);
+        }
+
+        if let Some(created) = constructor(key_str).await {
+            let _ = self.set_one(key_str, &created).await;
+            Some(created)
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_many_or_create<'a, V, K: IntoKeys + 'a>(
+        &self,
+        keys: K,
+        constructor: impl for<'b> AsyncFn(&'b str) -> Option<V>,
+    ) -> impl IntoIterator<Item = (<K as IntoKeys>::Key<'a>, V)>
+    where
+        V: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync,
+    {
+        keys.into_keys()
             .into_iter()
-            .map(|key| self.retrieve_or_else(key, constructor))
+            .map(|key| async {
+                if let Ok(value) = self.get_one::<V>(key.as_ref()).await {
+                    return Result::<(<K as IntoKeys>::Key<'a>, V), ()>::Ok((key, value));
+                }
+
+                let created = constructor(key.as_ref()).await.ok_or(())?;
+                self.set_one(key.as_ref(), &created)
+                    .await
+                    .map_err(|_err| ())?;
+
+                Ok((key, created))
+            })
             .collect::<JoinAll<_>>()
             .await
             .into_iter()
-            .filter_map(Result::ok);
-
-        Ok(results)
+            .flatten()
     }
 }
 
@@ -252,10 +251,10 @@ mod tests {
     use bytes::Bytes;
     use serde_derive::{Deserialize, Serialize};
 
-    use crate::{CachedRepresentation, DistributedCache, MockDistributedCache};
+    use crate::{CachedRepresentation, DistributedCache};
 
     use super::*;
-    use std::{collections::HashMap, time::Duration};
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct TestDistributedCache {
@@ -321,11 +320,11 @@ mod tests {
         };
 
         // Cache the data
-        cache.cache("test_key", test_data.clone()).await.unwrap();
+        cache.set(("test_key", &test_data)).await;
 
         // Retrieve the data
-        let retrieved: TestData = cache.retrieve("test_key").await.unwrap().value;
-        assert_eq!(retrieved.value, test_data.value);
+        let item: TestData = cache.get(String::from("test_key")).await.unwrap();
+        assert_eq!(item.value, test_data.value);
     }
 
     #[tokio::test]
@@ -337,9 +336,9 @@ mod tests {
             .build();
 
         // Try to retrieve a key that doesn't exist
-        let result: anyhow::Result<KeyValuePair<TestData>> =
-            cache.retrieve("nonexistent_key").await;
-        assert!(result.is_err());
+        let result: Option<TestData> = cache.get("nonexistent_key").await;
+
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -356,11 +355,9 @@ mod tests {
             value: "binary_test".to_string(),
         };
 
-        cache_binary
-            .cache("binary_key", test_data.clone())
-            .await
-            .unwrap();
-        let retrieved: TestData = cache_binary.retrieve("binary_key").await.unwrap().value;
+        cache_binary.set(("binary_key", test_data.clone())).await;
+
+        let retrieved: TestData = cache_binary.get("binary_key").await.unwrap();
         assert_eq!(retrieved.value, test_data.value);
 
         // Test with JSON representation
@@ -373,18 +370,17 @@ mod tests {
             value: "json_test".to_string(),
         };
 
-        cache_json
-            .cache("json_key", test_data_json.clone())
-            .await
-            .unwrap();
-        let retrieved_json: TestData = cache_json.retrieve("json_key").await.unwrap().value;
+        cache_json.set(("json_key", test_data_json.clone())).await;
+
+        let retrieved_json: TestData = cache_json.get("json_key").await.unwrap();
+
         assert_eq!(retrieved_json.value, test_data_json.value);
     }
 
     #[tokio::test]
     async fn test_cache_with_string_key() {
         let distributed_cache = TestDistributedCache::default();
-        let mut cache = HybridCache::builder()
+        let cache = HybridCache::builder()
             .distributed_cache(distributed_cache)
             .cached_representation(CachedRepresentation::Binary)
             .build();
@@ -394,20 +390,18 @@ mod tests {
         };
 
         // Test with &str key
-        cache.cache("string_key", test_data.clone()).await.unwrap();
-        let retrieved: TestData = cache.retrieve("string_key").await.unwrap().value;
+        cache.set(("string_key", test_data.clone())).await;
+
+        let retrieved: TestData = cache.get("string_key").await.unwrap();
         assert_eq!(retrieved.value, test_data.value);
 
         // Test with String key
         cache
-            .cache("owned_string_key".to_string(), test_data.clone())
-            .await
-            .unwrap();
-        let retrieved2: TestData = cache
-            .retrieve("owned_string_key".to_string())
-            .await
-            .unwrap()
-            .value;
+            .set(("owned_string_key".to_string(), test_data.clone()))
+            .await;
+
+        let retrieved2: TestData = cache.get("owned_string_key".to_string()).await.unwrap();
+
         assert_eq!(retrieved2.value, test_data.value);
     }
 
@@ -420,37 +414,37 @@ mod tests {
             .build();
 
         let kvps = vec![
-            KeyValuePair {
-                key: "key1".to_string(),
-                value: TestData {
+            (
+                "key1".to_string(),
+                TestData {
                     value: "value1".to_string(),
                 },
-            },
-            KeyValuePair {
-                key: "key2".to_string(),
-                value: TestData {
+            ),
+            (
+                "key2".to_string(),
+                TestData {
                     value: "value2".to_string(),
                 },
-            },
-            KeyValuePair {
-                key: "key3".to_string(),
-                value: TestData {
+            ),
+            (
+                "key3".to_string(),
+                TestData {
                     value: "value3".to_string(),
                 },
-            },
+            ),
         ];
 
         // Cache multiple items
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.cache_many(kvps).await;
+        static_cache.set(kvps).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify all items were cached
-        let retrieved1: TestData = static_cache.retrieve("key1").await.unwrap().value;
-        let retrieved2: TestData = static_cache.retrieve("key2").await.unwrap().value;
-        let retrieved3: TestData = static_cache.retrieve("key3").await.unwrap().value;
+        let retrieved1: TestData = static_cache.get("key1").await.unwrap();
+        let retrieved2: TestData = static_cache.get("key2").await.unwrap();
+        let retrieved3: TestData = static_cache.get("key3").await.unwrap();
 
         assert_eq!(retrieved1.value, "value1");
         assert_eq!(retrieved2.value, "value2");
@@ -476,29 +470,25 @@ mod tests {
             value: "multi_value3".to_string(),
         };
 
-        cache.cache("multi_key1", test_data1.clone()).await.unwrap();
-        cache.cache("multi_key2", test_data2.clone()).await.unwrap();
-        cache.cache("multi_key3", test_data3.clone()).await.unwrap();
+        cache.set(("multi_key1", test_data1.clone())).await;
+        cache.set(("multi_key2", test_data2.clone())).await;
+        cache.set(("multi_key3", test_data3.clone())).await;
 
         // Retrieve multiple items
         let static_cache = Box::leak(Box::new(cache));
         let keys = vec!["multi_key1", "multi_key2", "multi_key3"];
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many(keys)
-            .await
-            .unwrap()
-            .into_iter()
-            .collect();
+        let results: Vec<(&str, TestData)> =
+            static_cache.get_many(keys).await.into_iter().collect();
 
         assert_eq!(results.len(), 3);
 
         // Sort results by key for consistent testing
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| a.key.cmp(&b.key));
+        sorted_results.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(sorted_results[0].value.value, "multi_value1");
-        assert_eq!(sorted_results[1].value.value, "multi_value2");
-        assert_eq!(sorted_results[2].value.value, "multi_value3");
+        assert_eq!(sorted_results[0].1.value, "multi_value1");
+        assert_eq!(sorted_results[1].1.value, "multi_value2");
+        assert_eq!(sorted_results[2].1.value, "multi_value3");
     }
 
     #[tokio::test]
@@ -513,21 +503,18 @@ mod tests {
         let test_data = TestData {
             value: "existing_value".to_string(),
         };
-        cache.cache("existing_key", test_data).await.unwrap();
+
+        cache.set(("existing_key", test_data)).await;
 
         // Try to retrieve multiple keys where some don't exist
         let static_cache = Box::leak(Box::new(cache));
         let keys = vec!["existing_key", "missing_key1", "missing_key2"];
-        let result: anyhow::Result<Vec<KeyValuePair<TestData>>> = static_cache
-            .retrieve_many(keys)
-            .await
-            .map(|iter| iter.into_iter().collect());
+        let result: Vec<(&str, TestData)> = static_cache.get_many(keys).await.into_iter().collect();
 
         // Should only retrieve the present keys
-        assert!(result.is_ok());
-        assert_eq!(result.as_ref().unwrap().len(), 1);
-        assert_eq!(result.as_ref().unwrap()[0].key, "existing_key");
-        assert_eq!(result.as_ref().unwrap()[0].value.value, "existing_value");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "existing_key");
+        assert_eq!(result[0].1.value, "existing_value");
     }
 
     #[tokio::test]
@@ -539,37 +526,30 @@ mod tests {
             .build();
 
         let kvps = vec![
-            KeyValuePair {
-                key: "string_key1".to_string(),
-                value: TestData {
+            (
+                "string_key1".to_string(),
+                TestData {
                     value: "string_value1".to_string(),
                 },
-            },
-            KeyValuePair {
-                key: "string_key2".to_string(),
-                value: TestData {
+            ),
+            (
+                "string_key2".to_string(),
+                TestData {
                     value: "string_value2".to_string(),
                 },
-            },
+            ),
         ];
 
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.cache_many(kvps).await;
+        static_cache.set(kvps).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify items were cached with string keys
-        let retrieved1: TestData = static_cache
-            .retrieve("string_key1".to_string())
-            .await
-            .unwrap()
-            .value;
-        let retrieved2: TestData = static_cache
-            .retrieve("string_key2".to_string())
-            .await
-            .unwrap()
-            .value;
+        let retrieved1: TestData = static_cache.get("string_key1").await.unwrap();
+
+        let retrieved2: TestData = static_cache.get("string_key2").await.unwrap();
 
         assert_eq!(retrieved1.value, "string_value1");
         assert_eq!(retrieved2.value, "string_value2");
@@ -588,24 +568,19 @@ mod tests {
         };
 
         // Cache the data first
-        cache
-            .cache("existing_key", test_data.clone())
-            .await
-            .unwrap();
-
-        // Create a constructor that should not be called
-        let constructor = |_key: &str| TestData {
-            value: "should_not_be_created".to_string(),
-        };
+        cache.set(("existing_key", &test_data)).await;
 
         // Retrieve or cache should return the existing value
-        let result = cache
-            .retrieve_or_else("existing_key", constructor)
+        let result: TestData = cache
+            .get_or_create("existing_key", async |_key| {
+                Some(TestData {
+                    value: "should_not_be_created".to_string(),
+                })
+            })
             .await
             .unwrap();
 
-        assert_eq!(result.key, "existing_key");
-        assert_eq!(result.value.value, "existing_data");
+        assert_eq!(result.value, "existing_data");
     }
 
     #[tokio::test]
@@ -616,22 +591,23 @@ mod tests {
             .cached_representation(CachedRepresentation::Binary)
             .build();
 
-        // Create a constructor that will be called for missing keys
-        let constructor = |key: &str| TestData {
-            value: format!("constructed_value_for_{}", key),
-        };
+        // // Create a constructor that will be called for missing keys
+        // let constructor = ;
 
         // Retrieve or cache should create and cache the value
         let result = cache
-            .retrieve_or_else("missing_key", constructor)
+            .get_or_create("missing_key", async |key| {
+                Some(TestData {
+                    value: format!("constructed_value_for_{}", key),
+                })
+            })
             .await
             .unwrap();
 
-        assert_eq!(result.key, "missing_key");
-        assert_eq!(result.value.value, "constructed_value_for_missing_key");
+        assert_eq!(result.value, "constructed_value_for_missing_key");
 
         // Verify the value was actually cached
-        let retrieved: TestData = cache.retrieve("missing_key").await.unwrap().value;
+        let retrieved: TestData = cache.get("missing_key").await.unwrap();
         assert_eq!(retrieved.value, "constructed_value_for_missing_key");
     }
 
@@ -643,18 +619,19 @@ mod tests {
             .cached_representation(CachedRepresentation::Binary)
             .build();
 
-        let constructor = |key: String| TestData {
-            value: format!("constructed_{}", key),
+        let constructor = async |key: &str| {
+            Some(TestData {
+                value: format!("constructed_{}", key),
+            })
         };
 
         // Test with owned String key
         let result = cache
-            .retrieve_or_else("string_key".to_string(), constructor)
+            .get_or_create("string_key".to_string(), constructor)
             .await
             .unwrap();
 
-        assert_eq!(result.key, "string_key");
-        assert_eq!(result.value.value, "constructed_string_key");
+        assert_eq!(result.value, "constructed_string_key");
     }
 
     #[tokio::test]
@@ -673,21 +650,20 @@ mod tests {
             value: "existing_value2".to_string(),
         };
 
-        cache.cache("key1", test_data1.clone()).await.unwrap();
-        cache.cache("key2", test_data2.clone()).await.unwrap();
+        cache.set(("key1", test_data1.clone())).await;
+        cache.set(("key2", test_data2.clone())).await;
 
         // Create KVPs with dummy values (should not be used)
         let kvps = vec!["key1".to_string(), "key2".to_string()];
 
-        let constructor = |_key| TestData {
-            value: "should_not_be_created".to_string(),
-        };
-
         let static_cache = Box::leak(Box::new(cache));
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many_or_else(kvps, constructor)
+        let results: Vec<(String, TestData)> = static_cache
+            .get_many_or_create(kvps, async |_key| {
+                Some(TestData {
+                    value: "should_not_be_created".to_string(),
+                })
+            })
             .await
-            .unwrap()
             .into_iter()
             .collect();
 
@@ -695,12 +671,12 @@ mod tests {
 
         // Sort results by key for consistent testing
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| a.key.cmp(&b.key));
+        sorted_results.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(sorted_results[0].key, "key1");
-        assert_eq!(sorted_results[0].value.value, "existing_value1");
-        assert_eq!(sorted_results[1].key, "key2");
-        assert_eq!(sorted_results[1].value.value, "existing_value2");
+        assert_eq!(sorted_results[0].0, "key1");
+        assert_eq!(sorted_results[0].1.value, "existing_value1");
+        assert_eq!(sorted_results[1].0, "key2");
+        assert_eq!(sorted_results[1].1.value, "existing_value2");
     }
 
     #[tokio::test]
@@ -714,15 +690,16 @@ mod tests {
         // Create KVPs for non-existent keys
         let kvps = vec!["new_key1".to_string(), "new_key2".to_string()];
 
-        let constructor = |key| TestData {
-            value: format!("constructed_{}", key),
+        let constructor = async |key: &str| {
+            Some(TestData {
+                value: format!("constructed_{}", key),
+            })
         };
 
         let static_cache = Box::leak(Box::new(cache));
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many_or_else(kvps, constructor)
+        let results: Vec<(String, TestData)> = static_cache
+            .get_many_or_create(kvps, constructor)
             .await
-            .unwrap()
             .into_iter()
             .collect();
 
@@ -730,16 +707,16 @@ mod tests {
 
         // Sort results by key for consistent testing
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| a.key.cmp(&b.key));
+        sorted_results.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(sorted_results[0].key, "new_key1");
-        assert_eq!(sorted_results[0].value.value, "constructed_new_key1");
-        assert_eq!(sorted_results[1].key, "new_key2");
-        assert_eq!(sorted_results[1].value.value, "constructed_new_key2");
+        assert_eq!(sorted_results[0].0, "new_key1");
+        assert_eq!(sorted_results[0].1.value, "constructed_new_key1");
+        assert_eq!(sorted_results[1].0, "new_key2");
+        assert_eq!(sorted_results[1].1.value, "constructed_new_key2");
 
         // Verify values were actually cached
-        let cached1: TestData = static_cache.retrieve("new_key1").await.unwrap().value;
-        let cached2: TestData = static_cache.retrieve("new_key2").await.unwrap().value;
+        let cached1: TestData = static_cache.get("new_key1").await.unwrap();
+        let cached2: TestData = static_cache.get("new_key2").await.unwrap();
 
         assert_eq!(cached1.value, "constructed_new_key1");
         assert_eq!(cached2.value, "constructed_new_key2");
@@ -757,20 +734,21 @@ mod tests {
         let existing_data = TestData {
             value: "pre_existing".to_string(),
         };
-        cache.cache("existing_key", existing_data).await.unwrap();
+        cache.set(("existing_key", existing_data)).await;
 
         // Create KVPs with mix of existing and new keys
         let kvps = vec!["existing_key".to_string(), "new_key".to_string()];
 
-        let constructor = |key| TestData {
-            value: format!("constructed_{key}"),
+        let constructor = async |key: &str| {
+            Some(TestData {
+                value: format!("constructed_{key}"),
+            })
         };
 
         let static_cache = Box::leak(Box::new(cache));
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many_or_else(kvps, constructor)
+        let results: Vec<(String, TestData)> = static_cache
+            .get_many_or_create(kvps, constructor)
             .await
-            .unwrap()
             .into_iter()
             .collect();
 
@@ -778,15 +756,15 @@ mod tests {
 
         // Sort results by key for consistent testing
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| a.key.cmp(&b.key));
+        sorted_results.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Existing key should return pre-existing value
-        assert_eq!(sorted_results[0].key, "existing_key");
-        assert_eq!(sorted_results[0].value.value, "pre_existing");
+        assert_eq!(sorted_results[0].0, "existing_key");
+        assert_eq!(sorted_results[0].1.value, "pre_existing");
 
         // New key should return constructed value
-        assert_eq!(sorted_results[1].key, "new_key");
-        assert_eq!(sorted_results[1].value.value, "constructed_new_key");
+        assert_eq!(sorted_results[1].0, "new_key");
+        assert_eq!(sorted_results[1].1.value, "constructed_new_key");
     }
 
     #[tokio::test]
@@ -799,33 +777,28 @@ mod tests {
 
         let keys = vec!["string_key1".to_string(), "string_key2".to_string()];
 
-        let constructor = |key: String| TestData {
-            value: format!("string_constructed_{}", key),
+        let constructor = async |key: &str| {
+            Some(TestData {
+                value: format!("string_constructed_{}", key),
+            })
         };
 
         let static_cache = Box::leak(Box::new(cache));
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many_or_else(keys, constructor)
+        let results: Vec<(String, TestData)> = static_cache
+            .get_many_or_create(keys, constructor)
             .await
-            .unwrap()
             .into_iter()
             .collect();
 
         assert_eq!(results.len(), 2);
 
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| a.key.cmp(&b.key));
+        sorted_results.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(sorted_results[0].key, "string_key1");
-        assert_eq!(
-            sorted_results[0].value.value,
-            "string_constructed_string_key1"
-        );
-        assert_eq!(sorted_results[1].key, "string_key2");
-        assert_eq!(
-            sorted_results[1].value.value,
-            "string_constructed_string_key2"
-        );
+        assert_eq!(sorted_results[0].0, "string_key1");
+        assert_eq!(sorted_results[0].1.value, "string_constructed_string_key1");
+        assert_eq!(sorted_results[1].0, "string_key2");
+        assert_eq!(sorted_results[1].1.value, "string_constructed_string_key2");
     }
 
     #[tokio::test]
@@ -841,22 +814,23 @@ mod tests {
         };
 
         // Cache the data
-        cache.cache("test_key", test_data.clone()).await.unwrap();
+        cache.set(("test_key", test_data.clone())).await;
 
         // Verify data is in memory cache
-        let memory_result = cache
-            .retrieve_from_memory::<TestData>("test_key".to_string())
-            .await;
+        let memory_result = cache.retrieve_from_memory("test_key").await;
         assert!(memory_result.is_ok());
-        assert_eq!(memory_result.unwrap().value.value, test_data.value);
+
+        let memory_value: TestData =
+            deserialize_repr(&memory_result.unwrap(), cache.cached_representation).unwrap();
+        assert_eq!(memory_value, test_data);
 
         // Verify data is in distributed cache by bypassing memory cache
         let distributed_result = cache
-            .retrieve_from_distributed::<TestData>("test_key".to_string())
+            .retrieve_from_distributed::<TestData>("test_key")
             .await;
         assert!(distributed_result.is_ok());
         // Note: TestDistributedCache returns "mock_key" as the key, but the value should match
-        assert_eq!(distributed_result.unwrap().value.value, test_data.value);
+        assert_eq!(distributed_result.unwrap().value, test_data.value);
     }
 
     #[tokio::test]
@@ -881,13 +855,11 @@ mod tests {
             .unwrap();
 
         // Verify memory cache doesn't have the value
-        let memory_result = cache
-            .retrieve_from_memory::<TestData>("fallback_key".to_string())
-            .await;
+        let memory_result = cache.retrieve_from_memory("fallback_key").await;
         assert!(memory_result.is_err());
 
         // Retrieve should fallback to distributed cache
-        let retrieved: TestData = cache.retrieve("fallback_key").await.unwrap().value;
+        let retrieved: TestData = cache.get("fallback_key").await.unwrap();
         assert_eq!(retrieved.value, test_data.value);
     }
 
@@ -923,7 +895,7 @@ mod tests {
             .await;
 
         // Retrieve should return memory cache value (not distributed)
-        let retrieved: TestData = cache.retrieve("priority_key").await.unwrap().value;
+        let retrieved: TestData = cache.get("priority_key").await.unwrap();
         assert_eq!(retrieved.value, "memory_priority");
     }
 
@@ -936,9 +908,8 @@ mod tests {
             .build();
 
         // Try to retrieve a key that doesn't exist in either cache
-        let result: anyhow::Result<KeyValuePair<TestData>> =
-            cache.retrieve("nonexistent_key").await;
-        assert!(result.is_err());
+        let result: Option<TestData> = cache.get("nonexistent_key").await;
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -950,52 +921,54 @@ mod tests {
             .build();
 
         let kvps = vec![
-            KeyValuePair {
-                key: "multi_key1".to_string(),
-                value: TestData {
+            (
+                "multi_key1".to_string(),
+                TestData {
                     value: "multi_value1".to_string(),
                 },
-            },
-            KeyValuePair {
-                key: "multi_key2".to_string(),
-                value: TestData {
+            ),
+            (
+                "multi_key2".to_string(),
+                TestData {
                     value: "multi_value2".to_string(),
                 },
-            },
+            ),
         ];
 
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.cache_many(kvps.clone()).await;
+        static_cache.set(kvps.clone()).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify both items are in memory cache
         for kvp in &kvps {
-            let memory_result = static_cache
-                .retrieve_from_memory::<TestData>(kvp.key.clone())
-                .await;
+            let memory_result = static_cache.retrieve_from_memory(&kvp.0).await;
+
             assert!(memory_result.is_ok());
-            assert_eq!(memory_result.unwrap().value.value, kvp.value.value);
+
+            let parsed = postcard::from_bytes::<TestData>(&memory_result.unwrap());
+
+            assert_eq!(parsed.unwrap().value, kvp.1.value);
+        }
+        // Verify both items are in memory cache
+        for (key, value) in &kvps {
+            let memory_result = static_cache.retrieve_from_memory(key).await;
+            assert!(memory_result.is_ok());
+            let memory_value: TestData =
+                deserialize_repr(&memory_result.unwrap(), static_cache.cached_representation)
+                    .unwrap();
+            assert_eq!(memory_value.value, value.value);
         }
 
         // Verify both items are in distributed cache
-        for kvp in &kvps {
+        for (key, value) in &kvps {
             let distributed_result = static_cache
-                .retrieve_from_distributed::<TestData>(kvp.key.clone())
+                .retrieve_from_distributed::<TestData>(key)
                 .await;
             assert!(distributed_result.is_ok());
-            assert_eq!(distributed_result.unwrap().value.value, kvp.value.value);
+            assert_eq!(distributed_result.unwrap().value, value.value);
         }
-    }
-
-    #[tokio::test]
-    async fn test_retrieve_many_mixed_cache_levels() {
-        let distributed_cache = TestDistributedCache::default();
-        let cache = HybridCache::builder()
-            .distributed_cache(distributed_cache.clone())
-            .cached_representation(CachedRepresentation::Binary)
-            .build();
 
         let memory_only_data = TestData {
             value: "memory_only".to_string(),
@@ -1009,8 +982,9 @@ mod tests {
 
         // Populate memory only
         let serialized_memory =
-            serialize_repr(memory_only_data.clone(), cache.cached_representation).unwrap();
-        cache
+            serialize_repr(memory_only_data.clone(), static_cache.cached_representation).unwrap();
+
+        static_cache
             .in_memory_cache
             .insert("memory_key".to_string(), serialized_memory)
             .await;
@@ -1026,33 +1000,27 @@ mod tests {
             .unwrap();
 
         // Populate both caches
-        cache
-            .cache("both_key", both_caches_data.clone())
-            .await
-            .unwrap();
+        static_cache
+            .set(("both_key", both_caches_data.clone()))
+            .await;
 
-        let static_cache = Box::leak(Box::new(cache));
         let keys = vec!["memory_key", "distributed_key", "both_key"];
-        let results: Vec<KeyValuePair<TestData>> = static_cache
-            .retrieve_many(keys)
-            .await
-            .unwrap()
-            .into_iter()
-            .collect();
+        let results: Vec<(&str, TestData)> =
+            static_cache.get_many(keys).await.into_iter().collect();
 
         assert_eq!(results.len(), 3);
 
         // Find results by key
-        let memory_result = results.iter().find(|kvp| kvp.key == "memory_key").unwrap();
+        let memory_result = results.iter().find(|&kvp| kvp.0 == "memory_key").unwrap();
         let distributed_result = results
             .iter()
-            .find(|kvp| kvp.key == "distributed_key")
+            .find(|kvp| kvp.0 == "distributed_key")
             .unwrap();
-        let both_result = results.iter().find(|kvp| kvp.key == "both_key").unwrap();
+        let both_result = results.iter().find(|kvp| kvp.0 == "both_key").unwrap();
 
-        assert_eq!(memory_result.value.value, "memory_only");
-        assert_eq!(distributed_result.value.value, "distributed_only");
-        assert_eq!(both_result.value.value, "both_caches");
+        assert_eq!(memory_result.1.value, "memory_only");
+        assert_eq!(distributed_result.1.value, "distributed_only");
+        assert_eq!(both_result.1.value, "both_caches");
     }
 
     #[tokio::test]
@@ -1063,32 +1031,30 @@ mod tests {
             .cached_representation(CachedRepresentation::Binary)
             .build();
 
-        let constructor = |key: &str| TestData {
-            value: format!("constructed_{}", key),
+        let constructor = async |key: &str| {
+            Some(TestData {
+                value: format!("constructed_{}", key),
+            })
         };
 
         // Key doesn't exist in either cache
-        let result = cache
-            .retrieve_or_else("new_key", constructor)
-            .await
-            .unwrap();
-        assert_eq!(result.value.value, "constructed_new_key");
+        let result = cache.get_or_create("new_key", constructor).await.unwrap();
+
+        assert_eq!(result.value, "constructed_new_key");
 
         // Verify both caches now have the constructed value
-        let memory_result = cache
-            .retrieve_from_memory::<TestData>("new_key".to_string())
-            .await;
-        assert!(memory_result.is_ok());
-        assert_eq!(memory_result.unwrap().value.value, "constructed_new_key");
+        let memory_result = cache.retrieve_from_memory("new_key").await;
 
-        let distributed_result = cache
-            .retrieve_from_distributed::<TestData>("new_key".to_string())
-            .await;
+        assert!(memory_result.is_ok());
+
+        let parsed = postcard::from_bytes::<TestData>(&memory_result.unwrap()).unwrap();
+
+        assert_eq!(parsed.value, "constructed_new_key");
+
+        let distributed_result = cache.retrieve_from_distributed::<TestData>("new_key").await;
+
         assert!(distributed_result.is_ok());
-        assert_eq!(
-            distributed_result.unwrap().value.value,
-            "constructed_new_key"
-        );
+        assert_eq!(distributed_result.unwrap().value, "constructed_new_key");
     }
 
     #[tokio::test]
@@ -1112,16 +1078,19 @@ mod tests {
             .await
             .unwrap();
 
-        let constructor = |_key: &str| TestData {
-            value: "should_not_construct".to_string(),
+        let constructor = async |_key: &str| {
+            Some(TestData {
+                value: "should_not_construct".to_string(),
+            })
         };
 
         // Should retrieve from distributed cache, not construct
         let result = cache
-            .retrieve_or_else("fallback_test_key", constructor)
+            .get_or_create("fallback_test_key", constructor)
             .await
             .unwrap();
-        assert_eq!(result.value.value, "from_distributed");
+
+        assert_eq!(result.value, "from_distributed");
     }
 
     #[tokio::test]
@@ -1138,10 +1107,7 @@ mod tests {
             value: "serialization_test".to_string(),
         };
 
-        binary_cache
-            .cache("binary_key", test_data.clone())
-            .await
-            .unwrap();
+        binary_cache.set(("binary_key", test_data.clone())).await;
 
         // Verify memory cache has binary serialized data
         let binary_bytes = binary_cache
@@ -1149,6 +1115,7 @@ mod tests {
             .get("binary_key")
             .await
             .unwrap();
+
         let deserialized_binary: TestData =
             deserialize_repr(&binary_bytes, CachedRepresentation::Binary).unwrap();
         assert_eq!(deserialized_binary.value, test_data.value);
@@ -1159,10 +1126,7 @@ mod tests {
             .cached_representation(CachedRepresentation::Json)
             .build();
 
-        json_cache
-            .cache("json_key", test_data.clone())
-            .await
-            .unwrap();
+        json_cache.set(("json_key", test_data.clone())).await;
 
         // Verify memory cache has JSON serialized data
         let json_bytes = json_cache.in_memory_cache.get("json_key").await.unwrap();

@@ -53,7 +53,7 @@ impl crate::BatchingDistributedCache for RedisDistributedCache {
         Ok(())
     }
 
-    async fn retrieve_batch<'a, I>(&self, keys: I) -> anyhow::Result<Vec<Option<Bytes>>>
+    async fn retrieve_batch<'a, I>(&self, keys: I) -> anyhow::Result<Vec<(&'a str, Bytes)>>
     where
         I: IntoIterator<Item = &'a str> + Send,
     {
@@ -61,13 +61,12 @@ impl crate::BatchingDistributedCache for RedisDistributedCache {
 
         let keys_vec: Vec<&'a str> = keys.into_iter().collect();
 
-        let raw_values: Vec<Option<Vec<u8>>> = conn.mget(keys_vec).await?;
-
-        let values: Vec<Option<Bytes>> = raw_values
+        let values: Vec<Option<Bytes>> = conn.mget(&keys_vec).await?;
+        let pairs = keys_vec
             .into_iter()
-            .map(|opt| opt.map(Bytes::from))
+            .zip(values.into_iter().flatten())
             .collect();
 
-        Ok(values)
+        Ok(pairs)
     }
 }

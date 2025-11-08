@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use hybrid_cache_rs::{BatchingDistributedCache, DistributedCache};
 use rand::Rng;
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
+use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::redis::Redis;
 
 use std::time::Duration;
@@ -56,12 +56,26 @@ async fn redis_cache_batch_operations() -> anyhow::Result<()> {
     let keys = vec!["k1", "k2", "missing"];
     let vals = cache.retrieve_batch(keys).await?;
 
-    assert_eq!(vals.len(), 3);
-    assert_eq!(vals[0].as_deref(), Some(b"v1" as &[u8]));
-    assert_eq!(vals[1].as_deref(), Some(b"v2" as &[u8]));
-    assert!(vals[2].is_none());
+    assert_eq!(vals.len(), 2);
+    assert_eq!(vals[0].1, b"v1" as &[u8]);
+    assert_eq!(vals[1].1, b"v2" as &[u8]);
 
     Ok(())
+}
+
+use rand::distr::Alphanumeric;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct TestData {
+    value: String,
+}
+
+fn random_string(len: usize) -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
 }
 
 #[tokio::test]
@@ -80,50 +94,31 @@ async fn redis_cache_1000_random_hybrid() -> anyhow::Result<()> {
     // Small sleep to ensure redis is ready
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-    struct TestData {
-        value: String,
-    }
-
-    use hybrid_cache_rs::cache_entry::KeyValuePair;
-    use rand::distr::Alphanumeric;
-
-    fn random_string(len: usize) -> String {
-        rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(len)
-            .map(char::from)
-            .collect()
-    }
-
     let size = 1000usize;
-    let kvps: Vec<KeyValuePair<TestData>> = (0..size)
-        .map(|_| KeyValuePair {
-            key: random_string(16),
-            value: TestData {
-                value: random_string(64),
-            },
+    let kvps: Vec<(String, TestData)> = (0..size)
+        .map(|_| {
+            (
+                random_string(16),
+                TestData {
+                    value: random_string(64),
+                },
+            )
         })
         .collect();
 
     // Cache them using the hybrid cache (writes to in-memory and distributed)
-    cache.cache_many(kvps.clone()).await;
+    cache.set(kvps.clone()).await;
 
     // Retrieve by keys
-    let keys: Vec<String> = kvps.iter().map(|kv| kv.key.clone()).collect();
-    let retrieved: Vec<KeyValuePair<TestData>> = cache
-        .retrieve_many(keys)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect();
+    let keys: Vec<String> = kvps.iter().map(|kv| kv.0.clone()).collect();
+    let retrieved: Vec<(String, TestData)> = cache.get_many(keys).await.into_iter().collect();
 
     // Expect all items to be retrieved from in-memory cache
     assert_eq!(retrieved.len(), size);
 
     // spot-check some entries
     for i in 0..size {
-        assert_eq!(retrieved[i].value, kvps[i].value);
+        assert_eq!(retrieved[i].1, kvps[i].1);
     }
 
     Ok(())

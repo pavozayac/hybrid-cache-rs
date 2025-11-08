@@ -1,8 +1,7 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use hybrid_cache_rs::cache_entry::KeyValuePair;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hybrid_cache_rs::{CachedRepresentation, HybridCache, NoopDistributedCache};
-use rand::distr::Alphanumeric;
 use rand::Rng;
+use rand::distr::Alphanumeric;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TestData {
@@ -33,8 +32,8 @@ fn bench_single(c: &mut Criterion) {
                 let value = TestData {
                     value: random_string(64),
                 };
-                cache.cache(key.clone(), value.clone()).await.unwrap();
-                let _res: TestData = cache.retrieve(key).await.unwrap().value;
+                cache.set((key.clone(), value.clone())).await;
+                let _res: TestData = cache.get(key).await.unwrap();
             });
     });
 
@@ -57,24 +56,22 @@ fn bench_batch(c: &mut Criterion) {
                 .iter(|| {
                     let value = cache.clone();
                     async move {
-                        let kvps: Vec<KeyValuePair<TestData>> = (0..size)
-                            .map(|_| KeyValuePair {
-                                key: random_string(16),
-                                value: TestData {
-                                    value: random_string(64),
-                                },
+                        let kvps: Vec<(String, TestData)> = (0..size)
+                            .map(|_| {
+                                (
+                                    random_string(16),
+                                    TestData {
+                                        value: random_string(64),
+                                    },
+                                )
                             })
                             .collect();
 
-                        value.cache_many(kvps.clone()).await;
+                        value.set(kvps.clone()).await;
 
-                        let keys: Vec<String> = kvps.into_iter().map(|kv| kv.key).collect();
-                        let _: Vec<KeyValuePair<TestData>> = value
-                            .retrieve_many(keys)
-                            .await
-                            .unwrap()
-                            .into_iter()
-                            .collect();
+                        let keys: Vec<String> = kvps.into_iter().map(|kv| kv.0).collect();
+                        let _: Vec<(String, TestData)> =
+                            value.get_many(keys).await.into_iter().collect();
                     }
                 });
         });

@@ -6,6 +6,7 @@ use crate::{BatchingDistributedCache, DistributedCache};
 pub struct NoopDistributedCache;
 
 impl NoopDistributedCache {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
@@ -34,22 +35,20 @@ impl BatchingDistributedCache for NoopDistributedCache {
         Ok(())
     }
 
-    async fn retrieve_batch<'a, I>(&self, keys: I) -> anyhow::Result<Vec<Option<Bytes>>>
+    async fn retrieve_batch<'a, I>(&self, _keys: I) -> anyhow::Result<Vec<(&'a str, Bytes)>>
     where
         I: IntoIterator<Item = &'a str> + Send,
     {
-        let keys_vec: Vec<&'a str> = keys.into_iter().collect();
-        // Return a vector of None for all requested keys to indicate misses
-        Ok(keys_vec.into_iter().map(|_| None).collect())
+        Ok(Vec::new())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache_entry::KeyValuePair, CachedRepresentation, HybridCache};
-    use rand::distr::Alphanumeric;
+    use crate::{CachedRepresentation, HybridCache};
     use rand::Rng;
+    use rand::distr::Alphanumeric;
 
     #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     struct TestData {
@@ -76,9 +75,9 @@ mod tests {
             value: "hello-noop".to_string(),
         };
 
-        cache.cache("test_key", data.clone()).await.unwrap();
+        cache.set(("test_key", data.clone())).await;
 
-        let got: TestData = cache.retrieve("test_key").await.unwrap().value;
+        let got: TestData = cache.get("test_key").await.unwrap();
         assert_eq!(got, data);
     }
 
@@ -91,29 +90,26 @@ mod tests {
             .build();
 
         let size = 1000usize;
-        let kvps: Vec<KeyValuePair<TestData>> = (0..size)
-            .map(|_| KeyValuePair {
-                key: random_string(16),
-                value: TestData {
-                    value: random_string(64),
-                },
+        let kvps: Vec<_> = (0..size)
+            .map(|_| {
+                (
+                    random_string(16),
+                    TestData {
+                        value: random_string(64),
+                    },
+                )
             })
             .collect();
 
-        cache.clone().cache_many(kvps.clone()).await;
+        cache.clone().set(kvps.clone()).await;
 
-        let keys: Vec<String> = kvps.iter().map(|kv| kv.key.clone()).collect();
-        let retrieved: Vec<KeyValuePair<TestData>> = cache
-            .retrieve_many(keys)
-            .await
-            .unwrap()
-            .into_iter()
-            .collect();
+        let keys: Vec<String> = kvps.iter().map(|kv| kv.0.clone()).collect();
+        let retrieved: Vec<(String, TestData)> = cache.get_many(keys).await.into_iter().collect();
 
         assert_eq!(retrieved.len(), size);
 
         for i in 0..size {
-            assert_eq!(retrieved[i].value, kvps[i].value);
+            assert_eq!(retrieved[i].1, kvps[i].1);
         }
     }
 }
