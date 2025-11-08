@@ -107,7 +107,7 @@ async fn redis_cache_1000_random_hybrid() -> anyhow::Result<()> {
         .collect();
 
     // Cache them using the hybrid cache (writes to in-memory and distributed)
-    cache.set(kvps.clone()).await;
+    cache.set_many(kvps.clone()).await;
 
     // Retrieve by keys
     let keys: Vec<String> = kvps.iter().map(|kv| kv.0.clone()).collect();

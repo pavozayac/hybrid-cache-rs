@@ -75,7 +75,7 @@ mod tests {
             value: "hello-noop".to_string(),
         };
 
-        cache.set(("test_key", data.clone())).await;
+        cache.set_many(("test_key", data.clone())).await;
 
         let got: TestData = cache.get("test_key").await.unwrap();
         assert_eq!(got, data);
@@ -101,7 +101,7 @@ mod tests {
             })
             .collect();
 
-        cache.clone().set(kvps.clone()).await;
+        cache.clone().set_many(kvps.clone()).await;
 
         let keys: Vec<String> = kvps.iter().map(|kv| kv.0.clone()).collect();
         let retrieved: Vec<(String, TestData)> = cache.get_many(keys).await.into_iter().collect();

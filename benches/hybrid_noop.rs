@@ -32,7 +32,7 @@ fn bench_single(c: &mut Criterion) {
                 let value = TestData {
                     value: random_string(64),
                 };
-                cache.set((key.clone(), value.clone())).await;
+                cache.set_many((key.clone(), value.clone())).await;
                 let _res: TestData = cache.get(key).await.unwrap();
             });
     });
@@ -67,7 +67,7 @@ fn bench_batch(c: &mut Criterion) {
                             })
                             .collect();
 
-                        value.set(kvps.clone()).await;
+                        value.set_many(kvps.clone()).await;
 
                         let keys: Vec<String> = kvps.into_iter().map(|kv| kv.0).collect();
                         let _: Vec<(String, TestData)> =

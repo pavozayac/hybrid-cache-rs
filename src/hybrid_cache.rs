@@ -137,7 +137,11 @@ where
         Ok(output)
     }
 
-    pub async fn set<S: serde::Serialize + Send + Sync>(&self, entries: impl AsEntries<S>) {
+    pub async fn set<S: serde::Serialize + Send + Sync>(&self, key: impl AsRef<str>, value: S) {
+        self.set_many((key.as_ref(), &value)).await;
+    }
+
+    pub async fn set_many<S: serde::Serialize + Send + Sync>(&self, entries: impl AsEntries<S>) {
         let _ = entries
             .as_entries()
             .into_iter()
@@ -271,8 +275,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DistributedCache for TestDistributedCache {
-        async fn cache_bytes(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
-            self.cache.insert(key.to_string(), bytes.to_vec()).await;
+        async fn cache_bytes(&self, key: &str, item: &[u8]) -> anyhow::Result<()> {
+            self.cache.insert(key.to_string(), item.to_vec()).await;
             Ok(())
         }
 
@@ -320,7 +324,7 @@ mod tests {
         };
 
         // Cache the data
-        cache.set(("test_key", &test_data)).await;
+        cache.set("test_key", &test_data).await;
 
         // Retrieve the data
         let item: TestData = cache.get(String::from("test_key")).await.unwrap();
@@ -355,7 +359,9 @@ mod tests {
             value: "binary_test".to_string(),
         };
 
-        cache_binary.set(("binary_key", test_data.clone())).await;
+        cache_binary
+            .set_many(("binary_key", test_data.clone()))
+            .await;
 
         let retrieved: TestData = cache_binary.get("binary_key").await.unwrap();
         assert_eq!(retrieved.value, test_data.value);
@@ -370,7 +376,9 @@ mod tests {
             value: "json_test".to_string(),
         };
 
-        cache_json.set(("json_key", test_data_json.clone())).await;
+        cache_json
+            .set_many(("json_key", test_data_json.clone()))
+            .await;
 
         let retrieved_json: TestData = cache_json.get("json_key").await.unwrap();
 
@@ -390,14 +398,14 @@ mod tests {
         };
 
         // Test with &str key
-        cache.set(("string_key", test_data.clone())).await;
+        cache.set_many(("string_key", test_data.clone())).await;
 
         let retrieved: TestData = cache.get("string_key").await.unwrap();
         assert_eq!(retrieved.value, test_data.value);
 
         // Test with String key
         cache
-            .set(("owned_string_key".to_string(), test_data.clone()))
+            .set_many(("owned_string_key".to_string(), test_data.clone()))
             .await;
 
         let retrieved2: TestData = cache.get("owned_string_key".to_string()).await.unwrap();
@@ -436,7 +444,7 @@ mod tests {
 
         // Cache multiple items
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.set(kvps).await;
+        static_cache.set_many(kvps).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -470,9 +478,9 @@ mod tests {
             value: "multi_value3".to_string(),
         };
 
-        cache.set(("multi_key1", test_data1.clone())).await;
-        cache.set(("multi_key2", test_data2.clone())).await;
-        cache.set(("multi_key3", test_data3.clone())).await;
+        cache.set_many(("multi_key1", test_data1.clone())).await;
+        cache.set_many(("multi_key2", test_data2.clone())).await;
+        cache.set_many(("multi_key3", test_data3.clone())).await;
 
         // Retrieve multiple items
         let static_cache = Box::leak(Box::new(cache));
@@ -504,7 +512,7 @@ mod tests {
             value: "existing_value".to_string(),
         };
 
-        cache.set(("existing_key", test_data)).await;
+        cache.set_many(("existing_key", test_data)).await;
 
         // Try to retrieve multiple keys where some don't exist
         let static_cache = Box::leak(Box::new(cache));
@@ -541,7 +549,7 @@ mod tests {
         ];
 
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.set(kvps).await;
+        static_cache.set_many(kvps).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -568,7 +576,7 @@ mod tests {
         };
 
         // Cache the data first
-        cache.set(("existing_key", &test_data)).await;
+        cache.set_many(("existing_key", &test_data)).await;
 
         // Retrieve or cache should return the existing value
         let result: TestData = cache
@@ -650,8 +658,8 @@ mod tests {
             value: "existing_value2".to_string(),
         };
 
-        cache.set(("key1", test_data1.clone())).await;
-        cache.set(("key2", test_data2.clone())).await;
+        cache.set_many(("key1", test_data1.clone())).await;
+        cache.set_many(("key2", test_data2.clone())).await;
 
         // Create KVPs with dummy values (should not be used)
         let kvps = vec!["key1".to_string(), "key2".to_string()];
@@ -734,7 +742,7 @@ mod tests {
         let existing_data = TestData {
             value: "pre_existing".to_string(),
         };
-        cache.set(("existing_key", existing_data)).await;
+        cache.set_many(("existing_key", existing_data)).await;
 
         // Create KVPs with mix of existing and new keys
         let kvps = vec!["existing_key".to_string(), "new_key".to_string()];
@@ -814,7 +822,7 @@ mod tests {
         };
 
         // Cache the data
-        cache.set(("test_key", test_data.clone())).await;
+        cache.set_many(("test_key", test_data.clone())).await;
 
         // Verify data is in memory cache
         let memory_result = cache.retrieve_from_memory("test_key").await;
@@ -936,7 +944,7 @@ mod tests {
         ];
 
         let static_cache = Box::leak(Box::new(cache));
-        static_cache.set(kvps.clone()).await;
+        static_cache.set_many(kvps.clone()).await;
 
         // Give tasks time to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1001,7 +1009,7 @@ mod tests {
 
         // Populate both caches
         static_cache
-            .set(("both_key", both_caches_data.clone()))
+            .set_many(("both_key", both_caches_data.clone()))
             .await;
 
         let keys = vec!["memory_key", "distributed_key", "both_key"];
@@ -1107,7 +1115,9 @@ mod tests {
             value: "serialization_test".to_string(),
         };
 
-        binary_cache.set(("binary_key", test_data.clone())).await;
+        binary_cache
+            .set_many(("binary_key", test_data.clone()))
+            .await;
 
         // Verify memory cache has binary serialized data
         let binary_bytes = binary_cache
@@ -1126,7 +1136,7 @@ mod tests {
             .cached_representation(CachedRepresentation::Json)
             .build();
 
-        json_cache.set(("json_key", test_data.clone())).await;
+        json_cache.set_many(("json_key", test_data.clone())).await;
 
         // Verify memory cache has JSON serialized data
         let json_bytes = json_cache.in_memory_cache.get("json_key").await.unwrap();
