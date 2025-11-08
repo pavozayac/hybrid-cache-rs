@@ -11,7 +11,7 @@ jobs:
           rustup update stable
           cargo install cargo-nextest
       - name: Run tests
-        run: cargo nextest run
+        run: cargo nextest run --no-fail-fast
       - name: Lint
         run: cargo clippy
       - name: Check formatting
