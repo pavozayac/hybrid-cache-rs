@@ -1,13 +1,14 @@
 use bytes::Bytes;
+pub mod backends;
 mod hybrid_cache;
 pub use hybrid_cache::HybridCache;
-pub mod redis_impl;
-pub use redis_impl::RedisDistributedCache;
-mod noop_impl;
-pub use noop_impl::NoopDistributedCache;
 mod cache_entry;
 mod entry;
 mod key;
+
+pub use backends::memcached_impl::MemcachedDistributedCache;
+pub use backends::noop_impl::NoopDistributedCache;
+pub use backends::redis_impl::RedisDistributedCache;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
@@ -25,7 +26,7 @@ pub trait BatchingDistributedCache {
 
     async fn retrieve_batch<'a, I>(&self, keys: I) -> anyhow::Result<Vec<(&'a str, Bytes)>>
     where
-        I: IntoIterator<Item = &'a str> + Send;
+        I: IntoIterator<Item = &'a str> + Send + Clone;
 }
 
 #[derive(Debug, Clone, Copy)]

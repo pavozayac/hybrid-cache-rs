@@ -15,13 +15,11 @@ impl NoopDistributedCache {
 #[async_trait::async_trait]
 impl DistributedCache for NoopDistributedCache {
     async fn cache_bytes(&self, _key: &str, _item: &[u8]) -> anyhow::Result<()> {
-        // no-op: pretend to store
         Ok(())
     }
 
     async fn retrieve_bytes(&self, _key: &str) -> anyhow::Result<Bytes> {
-        // no-op: indicate not found by returning an error similar to redis impl when missing
-        Err(anyhow::anyhow!("NoopDistributedCache: key not found"))
+        anyhow::bail!("NoopDistributedCache: key not found")
     }
 }
 
@@ -31,7 +29,6 @@ impl BatchingDistributedCache for NoopDistributedCache {
     where
         I: IntoIterator<Item = (&'a str, Bytes)> + Send,
     {
-        // no-op
         Ok(())
     }
 

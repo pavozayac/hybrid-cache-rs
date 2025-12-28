@@ -1,36 +1,32 @@
 use bytes::Bytes;
 use hybrid_cache_rs::{BatchingDistributedCache, DistributedCache};
 use rand::Rng;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
-use testcontainers_modules::redis::Redis;
+use testcontainers::{ContainerAsync, GenericImage, runners::AsyncRunner};
 
 use std::time::Duration;
 
-async fn redis_container() -> anyhow::Result<(ContainerAsync<Redis>, String)> {
-    // Start a docker-backed Redis container using testcontainers
-    let node = testcontainers_modules::redis::Redis::default()
+async fn memcached_container() -> anyhow::Result<(ContainerAsync<GenericImage>, String)> {
+    let node = testcontainers::GenericImage::new("memcached", "1.6-alpine")
         .start()
         .await?;
 
-    // Obtain the mapped port and build a redis URL
-    let host = node.get_host_port_ipv4(6379).await?;
-    let redis_url = format!("redis://127.0.0.1:{host}");
+    let host = node.get_host_port_ipv4(11211).await?;
+    let memcached_url = format!("memcache://127.0.0.1:{host}");
 
-    Ok((node, redis_url))
+    Ok((node, memcached_url))
 }
 
 #[tokio::test]
-async fn redis_cache_single_operations() -> anyhow::Result<()> {
-    let (_container, redis_url) = redis_container().await?;
-    // Create the cache implementation
-    let cache = hybrid_cache_rs::RedisDistributedCache::new(&redis_url)?;
+async fn memcached_impl_single_operations() -> anyhow::Result<()> {
+    let (_container, memcached_url) = memcached_container().await?;
 
-    // Small sleep to ensure redis is ready to accept connections (testcontainers wait-for isn't always immediate)
+    let cache = hybrid_cache_rs::MemcachedDistributedCache::new(&memcached_url)?;
+
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Single-item cache/retrieve
     let key = "test:key:1";
     let payload = b"hello-world";
+
     cache.cache_bytes(key, payload).await?;
 
     let got = cache.retrieve_bytes(key).await?;
@@ -40,16 +36,13 @@ async fn redis_cache_single_operations() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn redis_cache_batch_operations() -> anyhow::Result<()> {
-    let (_container, redis_url) = redis_container().await?;
+async fn memcached_impl_batch_operations() -> anyhow::Result<()> {
+    let (_container, memcached_url) = memcached_container().await?;
 
-    // Create the cache implementation
-    let cache = hybrid_cache_rs::RedisDistributedCache::new(&redis_url)?;
+    let cache = hybrid_cache_rs::MemcachedDistributedCache::new(&memcached_url)?;
 
-    // Small sleep to ensure redis is ready to accept connections (testcontainers wait-for isn't always immediate)
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Batch operations
     let items = vec![("k1", Bytes::from("v1")), ("k2", Bytes::from("v2"))];
     cache.cache_batch(items.clone()).await?;
 
@@ -79,17 +72,17 @@ fn random_string(len: usize) -> String {
 }
 
 #[tokio::test]
-async fn redis_cache_1000_random_hybrid() -> anyhow::Result<()> {
-    let (_container, redis_url) = redis_container().await?;
+async fn memcached_impl_1000_random_hybrid() -> anyhow::Result<()> {
+    let (_container, memcached_url) = memcached_container().await?;
 
-    let distributed = hybrid_cache_rs::RedisDistributedCache::new(&redis_url)?;
+    let distributed = hybrid_cache_rs::MemcachedDistributedCache::new(&memcached_url)?;
 
     let cache = hybrid_cache_rs::HybridCache::builder()
         .distributed_cache(distributed)
         .cached_representation(hybrid_cache_rs::CachedRepresentation::Binary)
         .build();
 
-    // Small sleep to ensure redis is ready
+    // Small sleep to ensure memcached is ready
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let size = 1000usize;
