@@ -17,9 +17,12 @@ harness = false
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
+aws-config = "1.8.12"
+aws-sdk-dynamodb = "1.101.0"
 bon = "3.8.1"
 bytes = "1.10.1"
 futures = "0.3.31"
+itertools = "0.14.0"
 memcache = "0.19.0"
 moka = { version = "0.12.11", features = ["future"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
